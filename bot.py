@@ -21,7 +21,7 @@ async def post_next_question(channel: discord.abc.Messageable):
     try:
         payload, _ = generate_trivia(game["sport"], game["difficulty"], game["mode"])
     except Exception as e:
-        await channel.send("❌ OpenAI error: " + str(e))
+        await channel.send(f"❌ OpenAI error ({type(e).__name__}): `{repr(e)}`")
         return
 
     if not payload or payload.get("confidence", 0) < 0.6:
