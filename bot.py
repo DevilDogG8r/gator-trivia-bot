@@ -8,6 +8,14 @@ import discord
 from discord import app_commands
 
 import db
+# --- DB init (must run before commands/scheduler use db) ---
+try:
+    db.init_db()
+except Exception as e:
+    print("DB INIT FAILED:", e)
+    raise
+# --- end DB init ---
+
 from ai import generate_trivia
 from match import free_is_correct
 
