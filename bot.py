@@ -15,21 +15,21 @@ from match import free_is_correct
 # =============================
 # Defaults
 # =============================
-ANSWER_SECONDS = 30  # 30 seconds to answer each question
+ANSWER_SECONDS = 30
 
-EVENT_DAY_MINUTES = 1440            # 24 hours
-EVENT_DAY_INTERVAL_SECONDS = 300    # 5 minutes
+EVENT_DAY_MINUTES = 1440
+EVENT_DAY_INTERVAL_SECONDS = 300
 
-EVENT_WEEK_MINUTES = 10080          # 7 days
-EVENT_WEEK_INTERVAL_SECONDS = 1800  # 30 minutes (recommended to avoid spam)
+EVENT_WEEK_MINUTES = 10080
+EVENT_WEEK_INTERVAL_SECONDS = 1800
+
+MIN_SECONDS_BETWEEN_QUESTIONS = 15  # safety
 
 
 # =============================
-# Anti-spam / anti-repeat
+# Anti-spam safety
 # =============================
-LAST_ASKED_TS = {}      # channel_id -> last question unix ts
-RECENT_QHASH = {}       # channel_id -> [hashes]
-MIN_SECONDS_BETWEEN_QUESTIONS = 20  # safety against double-posts
+LAST_ASKED_TS = {}  # channel_id -> last question ts
 
 
 # =============================
@@ -66,8 +66,7 @@ async def trivia_scheduler(bot: discord.Client):
                     lb = db.get_event_leaderboard(ev["id"], limit=10)
 
                     if not lb:
-                        msg = "@everyone\n🏁 **Trivia event ended.** No answers recorded."
-                        await channel.send(msg)
+                        await channel.send("@everyone\n🏁 **Trivia event ended.** No answers recorded.")
                     else:
                         lines = [
                             "@everyone",
@@ -88,10 +87,7 @@ async def trivia_scheduler(bot: discord.Client):
                 # Post next question if due
                 if now >= ev["next_ts"]:
                     await post_next_question(channel)
-
-                    # keep exact interval (min_gap == max_gap in our events)
-                    nxt = now + int(ev["min_gap"])
-                    db.set_next_question_ts(ev["channel_id"], nxt)
+                    db.set_next_question_ts(ev["channel_id"], now + int(ev["min_gap"]))
 
         except Exception as e:
             print("SCHEDULER_ERROR:", repr(e))
@@ -106,7 +102,6 @@ async def post_next_question(channel: discord.abc.Messageable) -> bool:
     cid = str(channel.id)
     now = int(time.time())
 
-    # Cooldown safety
     if now - LAST_ASKED_TS.get(cid, 0) < MIN_SECONDS_BETWEEN_QUESTIONS:
         return False
 
@@ -119,58 +114,67 @@ async def post_next_question(channel: discord.abc.Messageable) -> bool:
     if sport == "All":
         sport = random.choice(["Football", "Basketball", "Baseball", "Gymnastics", "Softball"])
 
-    # Generate question
-    try:
-        payload, _ = generate_trivia(sport, game["difficulty"], game["mode"])
-    except Exception as e:
-        await channel.send(f"❌ OpenAI error: `{e}`")
-        return False
+    # Identify active event (if any)
+    ev = db.get_active_event_for_channel(cid)
+    event_id = ev["id"] if ev else None
 
-    if not payload or payload.get("confidence", 0) < 0.6:
-        return False
+    # Try multiple times to avoid repeats
+    for _ in range(6):
+        try:
+            payload, _ = generate_trivia(sport, game["difficulty"], game["mode"])
+        except Exception as e:
+            await channel.send(f"❌ OpenAI error: `{e}`")
+            return False
 
-    # Deduplicate questions
-    qh = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-    recent = RECENT_QHASH.get(cid, [])
-    if qh in recent:
-        return False
+        if not payload or payload.get("confidence", 0) < 0.6:
+            continue
 
-    RECENT_QHASH[cid] = (recent + [qh])[-15:]
-    LAST_ASKED_TS[cid] = now
+        qhash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
-    # Store question
-    if payload["type"] == "mcq":
-        answer_key = payload["choices"][int(payload["answer_index"])]
-    else:
-        answer_key = payload["answers"][0]
+        # If event is running, never repeat within that event
+        if event_id is not None and db.event_has_question(event_id, qhash):
+            continue
 
-    qid = db.record_question(cid, payload, answer_key, str(now))
+        # Accept question
+        if event_id is not None:
+            db.add_event_question(event_id, qhash)
 
-    # Build embed (30 sec timer)
-    embed = discord.Embed(
-        title=f"Florida Gators Trivia — {sport}",
-        description=payload["question"],
-        color=0xFA4616
-    )
-    embed.add_field(
-        name="Time Remaining",
-        value=f"<t:{now + ANSWER_SECONDS}:R>",
-        inline=False
-    )
+        # store question
+        if payload["type"] == "mcq":
+            answer_key = payload["choices"][int(payload["answer_index"])]
+        else:
+            answer_key = payload["answers"][0]
 
-    # Send
-    if payload["type"] == "mcq":
-        for lbl, opt in zip(["A", "B", "C", "D"], payload["choices"]):
-            embed.add_field(name=lbl, value=opt, inline=False)
-        await channel.send(embed=embed, view=MCQView(cid, qid, ANSWER_SECONDS))
-    else:
-        await channel.send(embed=embed, view=FreeView(cid, qid, ANSWER_SECONDS))
+        qid = db.record_question(cid, payload, answer_key, str(now))
+        LAST_ASKED_TS[cid] = now
 
-    return True
+        # Build embed + timer
+        embed = discord.Embed(
+            title=f"Florida Gators Trivia — {sport}",
+            description=payload["question"],
+            color=0xFA4616
+        )
+        embed.add_field(name="Time Remaining", value=f"<t:{now + ANSWER_SECONDS}:R>", inline=False)
+
+        if payload["type"] == "mcq":
+            for lbl, opt in zip(["A", "B", "C", "D"], payload["choices"]):
+                embed.add_field(name=lbl, value=opt, inline=False)
+            view = MCQView(cid, qid, ANSWER_SECONDS)
+            msg = await channel.send(embed=embed, view=view)
+            view.message = msg
+        else:
+            view = FreeView(cid, qid, ANSWER_SECONDS)
+            msg = await channel.send(embed=embed, view=view)
+            view.message = msg
+
+        return True
+
+    # If we can't get a non-repeat after several tries, just skip this cycle
+    return False
 
 
 # =============================
-# Views
+# Views (disable buttons on timeout)
 # =============================
 class MCQView(discord.ui.View):
     def __init__(self, channel_id: str, qid: int, timeout: int):
@@ -178,6 +182,16 @@ class MCQView(discord.ui.View):
         self.channel_id = channel_id
         self.qid = qid
         self.answered = set()
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self):
+        try:
+            for item in self.children:
+                item.disabled = True
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception as e:
+            print("VIEW_TIMEOUT_EDIT_FAILED:", repr(e))
 
     async def handle(self, interaction: discord.Interaction, idx: int):
         if interaction.user.id in self.answered:
@@ -191,13 +205,14 @@ class MCQView(discord.ui.View):
         correct = idx == int(payload["answer_index"])
 
         pts = points_for(db.get_game(self.channel_id)["difficulty"])
+
         ev = db.get_active_event_for_channel(str(interaction.channel_id))
         if ev:
             db.bump_event_score(ev["id"], str(interaction.user.id), correct, pts)
 
         correct_text = payload["choices"][int(payload["answer_index"])]
         msg = "✅ Correct!" if correct else f"❌ Wrong. Correct: **{correct_text}**"
-        await interaction.response.send_message(msg)
+        await interaction.response.send_message(msg, ephemeral=False)
 
     @discord.ui.button(label="A", style=discord.ButtonStyle.primary)
     async def a(self, i, _): await self.handle(i, 0)
@@ -226,6 +241,7 @@ class FreeAnswerModal(discord.ui.Modal, title="Your Answer"):
         correct = free_is_correct(self.answer.value, payload["answers"])
 
         pts = points_for(db.get_game(self.channel_id)["difficulty"])
+
         ev = db.get_active_event_for_channel(str(interaction.channel_id))
         if ev:
             db.bump_event_score(ev["id"], str(interaction.user.id), correct, pts)
@@ -239,6 +255,16 @@ class FreeView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.channel_id = channel_id
         self.qid = qid
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self):
+        try:
+            for item in self.children:
+                item.disabled = True
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception as e:
+            print("VIEW_TIMEOUT_EDIT_FAILED:", repr(e))
 
     @discord.ui.button(label="Submit Answer", style=discord.ButtonStyle.primary)
     async def submit(self, interaction, _):
@@ -246,17 +272,16 @@ class FreeView(discord.ui.View):
 
 
 # =============================
-# Commands
+# Commands (NO TIME INPUTS)
 # =============================
 class TriviaCog(app_commands.Group):
     def __init__(self):
         super().__init__(name="trivia", description="Florida Gators Trivia")
 
-    @app_commands.command(name="start", description="Start trivia in this channel (posts a question now)")
+    @app_commands.command(name="start", description="Post a question now (30 seconds to answer)")
     async def start(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
 
-        # Always force 30-second answering window
         db.upsert_game(
             str(interaction.channel_id),
             str(interaction.guild_id),
@@ -269,12 +294,11 @@ class TriviaCog(app_commands.Group):
         await interaction.followup.send("Trivia ready! 🎯 (30 seconds per question)")
         await post_next_question(interaction.channel)
 
-    @app_commands.command(name="event_day", description="24-hour event: question every 5 minutes, winner at end")
+    @app_commands.command(name="event_day", description="24-hour event: question every 5 minutes, top 10 @everyone at end")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def event_day(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
 
-        # Ensure game exists (forces 30 seconds)
         db.upsert_game(
             str(interaction.channel_id),
             str(interaction.guild_id),
@@ -294,17 +318,16 @@ class TriviaCog(app_commands.Group):
 
         await interaction.followup.send(
             "✅ **Day Trivia Event started!**\n"
-            "⏱️ **30 seconds** per question\n"
-            "🕔 One question every **5 minutes**\n"
-            "🏆 @everyone + Top 10 posted at the end"
+            "⏱️ **30 seconds** to answer\n"
+            "🕔 **Every 5 minutes**\n"
+            "🏆 **@everyone + Top 10** posted at the end"
         )
 
-    @app_commands.command(name="event_week", description="7-day event: question every 30 minutes, winner at end")
+    @app_commands.command(name="event_week", description="7-day event: question every 30 minutes, top 10 @everyone at end")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def event_week(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
 
-        # Ensure game exists (forces 30 seconds)
         db.upsert_game(
             str(interaction.channel_id),
             str(interaction.guild_id),
@@ -324,19 +347,19 @@ class TriviaCog(app_commands.Group):
 
         await interaction.followup.send(
             "✅ **Week Trivia Event started!**\n"
-            "⏱️ **30 seconds** per question\n"
-            "🕧 One question every **30 minutes**\n"
-            "🏆 @everyone + Top 10 posted at the end"
+            "⏱️ **30 seconds** to answer\n"
+            "🕧 **Every 30 minutes**\n"
+            "🏆 **@everyone + Top 10** posted at the end"
         )
 
-    @app_commands.command(name="event_stop", description="Stop the trivia event in this channel")
+    @app_commands.command(name="event_stop", description="Stop the active event in this channel")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def event_stop(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
         db.stop_event(str(interaction.channel_id))
-        await interaction.followup.send("🛑 Trivia event stopped.")
+        await interaction.followup.send("🛑 Event stopped.")
 
-    @app_commands.command(name="event_status", description="Show trivia event status in this channel")
+    @app_commands.command(name="event_status", description="Show event status for this channel")
     async def event_status(self, interaction: discord.Interaction):
         ev = db.get_active_event_for_channel(str(interaction.channel_id))
         if not ev:
@@ -352,13 +375,13 @@ class TriviaCog(app_commands.Group):
     async def help(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             "**Gator Trivia Commands**\n"
-            "`/trivia start` — post a question now (30 seconds)\n"
-            "`/trivia event_day` — 24h event, question every 5 min, winner at end\n"
-            "`/trivia event_week` — 7d event, question every 30 min, winner at end\n"
+            "`/trivia start` — post one question now (30 seconds)\n"
+            "`/trivia event_day` — 24h event, question every 5 min\n"
+            "`/trivia event_week` — 7d event, question every 30 min\n"
             "`/trivia event_status` — show time left + next post\n"
-            "`/trivia event_stop` — stop event in this channel\n"
+            "`/trivia event_stop` — stop the event\n"
             "\n"
-            "**Note:** Bot needs permission to mention @everyone in the channel.",
+            "**Note:** Bot needs permission to mention @everyone in that channel.",
             ephemeral=True
         )
 
