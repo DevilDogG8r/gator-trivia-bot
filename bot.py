@@ -41,11 +41,25 @@ FALLBACK_QUESTIONS = [
         "choices": ["SEC", "ACC", "Big Ten", "Big 12"],
         "answer_index": 0,
     },
+    {
+        "question": "Who is Florida’s biggest in-state rival (commonly)?",
+        "choices": ["FSU", "Miami", "UCF", "FAU"],
+        "answer_index": 0,
+    },
 ]
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+# Per-guild lock to prevent double-post race (start command + scheduler tick)
+GUILD_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for_guild(guild_id: str) -> asyncio.Lock:
+    if guild_id not in GUILD_LOCKS:
+        GUILD_LOCKS[guild_id] = asyncio.Lock()
+    return GUILD_LOCKS[guild_id]
 
 
 def _now() -> int:
@@ -104,11 +118,9 @@ async def _announce_end(channel: discord.abc.Messageable, event_id: int):
 
 
 class TriviaView(discord.ui.View):
-    def __init__(self, event_id: int, qid: str, question: str, choices: list[str], answer_index: int):
+    def __init__(self, event_id: int, choices: list[str], answer_index: int):
         super().__init__(timeout=ANSWER_WINDOW_SECONDS)
         self.event_id = event_id
-        self.qid = qid
-        self.question = question
         self.choices = choices
         self.answer_index = answer_index
         self.answered_users: set[int] = set()
@@ -158,6 +170,10 @@ class TriviaButton(discord.ui.Button):
 
 
 def _normalize_trivia(raw) -> dict | None:
+    """
+    Output:
+      {question:str, choices:[str], answer_index:int}
+    """
     if raw is None:
         return None
 
@@ -190,33 +206,22 @@ def _normalize_trivia(raw) -> dict | None:
     return None
 
 
-async def _get_trivia_nonrepeat(event_id: int) -> dict:
+async def _pick_trivia(event_id: int) -> dict:
+    # Try AI first
     if generate_trivia:
-        for _ in range(3):
+        for _ in range(5):
             try:
                 raw = generate_trivia()
                 if asyncio.iscoroutine(raw):
                     raw = await raw
                 trivia = _normalize_trivia(raw)
-                if not trivia:
-                    continue
-                qid = _qid(trivia["question"], trivia["choices"])
-                if db.event_has_question(event_id, qid):
-                    continue
-                trivia["qid"] = qid
-                return trivia
+                if trivia:
+                    trivia["qid"] = _qid(trivia["question"], trivia["choices"])
+                    return trivia
             except Exception as e:
                 print("AI_FAILED:", repr(e))
 
-    for _ in range(10):
-        trivia = random.choice(FALLBACK_QUESTIONS).copy()
-        trivia["question"] = _clean(trivia["question"])
-        trivia["choices"] = [_clean(c) for c in trivia["choices"]]
-        qid = _qid(trivia["question"], trivia["choices"])
-        if not db.event_has_question(event_id, qid):
-            trivia["qid"] = qid
-            return trivia
-
+    # Fallback
     trivia = random.choice(FALLBACK_QUESTIONS).copy()
     trivia["question"] = _clean(trivia["question"])
     trivia["choices"] = [_clean(c) for c in trivia["choices"]]
@@ -225,53 +230,73 @@ async def _get_trivia_nonrepeat(event_id: int) -> dict:
 
 
 async def _post_question_for_guild(guild_id: str):
-    event = db.get_active_event(guild_id)
-    if not event:
-        return
+    # Prevent double-post race per guild
+    async with _lock_for_guild(guild_id):
+        event = db.get_active_event(guild_id)
+        if not event:
+            return
 
-    event_id = int(event["id"])
-    channel_id = int(event["channel_id"])
-    now = _now()
-    next_ask = int(event["next_ask_ts"])
-    end_ts = int(event["end_ts"])
+        event_id = int(event["id"])
+        channel_id = int(event["channel_id"])
+        now = _now()
+        next_ask = int(event["next_ask_ts"])
+        end_ts = int(event["end_ts"])
 
-    if now >= end_ts:
+        if now >= end_ts:
+            channel = await _safe_fetch_channel(channel_id)
+            if channel:
+                await _announce_end(channel, event_id)
+            db.end_event(event_id)
+            return
+
+        if now < next_ask:
+            return
+
         channel = await _safe_fetch_channel(channel_id)
-        if channel:
-            await _announce_end(channel, event_id)
-        db.end_event(event_id)
-        return
+        if not channel:
+            print(f"POST_BLOCKED guild={guild_id} event={event_id} channel={channel_id}")
+            db.update_next_ask(event_id, now + 60)
+            return
 
-    if now < next_ask:
-        return
+        # HARD guarantee: record in DB first, only post if DB accepts it as new.
+        # We’ll try multiple pulls to find a non-duplicate.
+        posted = False
+        for _ in range(12):
+            trivia = await _pick_trivia(event_id)
+            qid = trivia["qid"]
 
-    trivia = await _get_trivia_nonrepeat(event_id)
+            # If record_question returns False, it's a duplicate -> DO NOT POST.
+            if not db.record_question(event_id, qid, now):
+                continue
 
-    db.record_question(event_id, trivia["qid"], now)
-    db.update_next_ask(event_id, now + QUESTION_INTERVAL_SECONDS)
+            # Now safe to post (unique within event)
+            db.update_next_ask(event_id, now + QUESTION_INTERVAL_SECONDS)
 
-    channel = await _safe_fetch_channel(channel_id)
-    if not channel:
-        print(f"Missing access to channel {channel_id}; rescheduling")
-        db.update_next_ask(event_id, now + 60)
-        return
+            embed = discord.Embed(title="🐊 Florida Gators Trivia", description=trivia["question"])
+            embed.set_footer(text=f"You have {ANSWER_WINDOW_SECONDS} seconds to answer.")
 
-    embed = discord.Embed(title="🐊 Florida Gators Trivia", description=trivia["question"])
-    embed.set_footer(text=f"You have {ANSWER_WINDOW_SECONDS} seconds to answer.")
+            view = TriviaView(event_id, trivia["choices"], int(trivia["answer_index"]))
+            msg = await channel.send(embed=embed, view=view)
+            view.message = msg
 
-    view = TriviaView(event_id, trivia["qid"], trivia["question"], trivia["choices"], int(trivia["answer_index"]))
-    msg = await channel.send(embed=embed, view=view)
-    view.message = msg
+            posted = True
+            break
+
+        if not posted:
+            # If we somehow can't find a new question, try again later.
+            db.update_next_ask(event_id, now + 60)
+            await channel.send("⚠️ Ran out of new questions for this event (temporarily). Trying again soon.")
 
 
 async def scheduler_loop():
     await client.wait_until_ready()
+    print("SCHEDULER_STARTED")
     while not client.is_closed():
-        try:
-            for g in client.guilds:
+        for g in client.guilds:
+            try:
                 await _post_question_for_guild(str(g.id))
-        except Exception as e:
-            print("SCHEDULER_ERROR:", repr(e))
+            except Exception as e:
+                print("SCHEDULER_GUILD_ERROR:", str(g.id), repr(e))
         await asyncio.sleep(15)
 
 
@@ -293,9 +318,16 @@ async def event_day(interaction: discord.Interaction):
 
     db.create_event(str(interaction.guild_id), str(channel_id), "day", now, end_ts)
 
-    channel = await _safe_fetch_channel(int(channel_id))
-    if channel:
-        await _announce_start(channel, "day")
+    try:
+        await _announce_start(interaction.channel, "day")
+    except Exception as e:
+        print("START_ANNOUNCE_FAILED:", repr(e))
+
+    # Post first question immediately (safe; lock prevents race)
+    try:
+        await _post_question_for_guild(str(interaction.guild_id))
+    except Exception as e:
+        print("START_POST_FIRST_FAILED:", repr(e))
 
     await interaction.followup.send("✅ Day event started.", ephemeral=True)
 
@@ -318,9 +350,16 @@ async def event_week(interaction: discord.Interaction):
 
     db.create_event(str(interaction.guild_id), str(channel_id), "week", now, end_ts)
 
-    channel = await _safe_fetch_channel(int(channel_id))
-    if channel:
-        await _announce_start(channel, "week")
+    try:
+        await _announce_start(interaction.channel, "week")
+    except Exception as e:
+        print("START_ANNOUNCE_FAILED:", repr(e))
+
+    # Post first question immediately (safe; lock prevents race)
+    try:
+        await _post_question_for_guild(str(interaction.guild_id))
+    except Exception as e:
+        print("START_POST_FIRST_FAILED:", repr(e))
 
     await interaction.followup.send("✅ Week event started.", ephemeral=True)
 
@@ -339,20 +378,16 @@ async def stop(interaction: discord.Interaction):
         return
 
     event_id = int(event["id"])
-    stored_channel = await _safe_fetch_channel(int(event["channel_id"]))
-
-    # If bot can't access the stored channel, use the channel where /stop was typed
-    channel_to_post = stored_channel
-    if channel_to_post is None:
-        channel_to_post = interaction.channel
+    channel = await _safe_fetch_channel(int(event["channel_id"]))
+    if not channel:
+        channel = interaction.channel
 
     try:
-        await _announce_end(channel_to_post, event_id)
+        await _announce_end(channel, event_id)
     except Exception as e:
         print("STOP_ANNOUNCE_END_FAILED:", repr(e))
 
     db.end_event(event_id)
-
     await interaction.followup.send("✅ Event stopped.", ephemeral=True)
 
 
