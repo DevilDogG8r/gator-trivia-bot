@@ -16,12 +16,6 @@ except Exception as e:
     generate_trivia = None
     print("WARN: ai.generate_trivia import failed:", repr(e))
 
-try:
-    from match import free_is_correct
-except Exception as e:
-    free_is_correct = None
-    print("WARN: match.free_is_correct import failed:", repr(e))
-
 # -------------------------
 # Config (Railway Variables)
 # -------------------------
@@ -39,29 +33,28 @@ ANSWER_WINDOW_SECONDS = 30
 db.init_db()
 
 # -------------------------
-# Fallback question bank (always works)
-# Keep choices <= 5 (Discord button row limit)
+# Fallback question bank
 # -------------------------
 FALLBACK_QUESTIONS = [
     {
         "question": "What year did Florida win its first football national championship?",
         "choices": ["1992", "1996", "2006", "2008"],
-        "answer": "1996",
+        "answer_index": 1,
     },
     {
         "question": "What is the nickname of Ben Hill Griffin Stadium?",
         "choices": ["The Swamp", "Death Valley", "The Horseshoe", "The Big House"],
-        "answer": "The Swamp",
+        "answer_index": 0,
     },
     {
         "question": "What are Florida’s official colors?",
         "choices": ["Orange & Blue", "Red & Black", "Green & Gold", "Maroon & Gold"],
-        "answer": "Orange & Blue",
+        "answer_index": 0,
     },
     {
         "question": "Which conference do the Florida Gators compete in?",
         "choices": ["SEC", "ACC", "Big Ten", "Big 12"],
-        "answer": "SEC",
+        "answer_index": 0,
     },
 ]
 
@@ -77,8 +70,16 @@ def _now() -> int:
     return int(time.time())
 
 
+def _clean_label(s: str) -> str:
+    # Remove stray commas and normalize whitespace
+    s = str(s).replace("\n", " ").replace("\r", " ")
+    s = s.replace(" ,", ",").replace(", ", " ").replace(",", " ")
+    s = " ".join(s.split())
+    return s.strip()
+
+
 def _qid(question_text: str, choices: list[str]) -> str:
-    payload = question_text + "|" + "|".join(choices)
+    payload = _clean_label(question_text) + "|" + "|".join(_clean_label(c) for c in choices)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -88,36 +89,43 @@ def _pick_channel_id(interaction: discord.Interaction) -> str:
 
 def _normalize_trivia(raw) -> dict | None:
     """
-    Normalize whatever generate_trivia returns into:
-      {question:str, choices:[str], answer:str}
+    Normalize AI output into:
+      {question:str, choices:[str], answer_index:int}
     """
     if raw is None:
         return None
 
+    # dict style
     if isinstance(raw, dict):
         q = raw.get("question") or raw.get("q")
         choices = raw.get("choices") or raw.get("answers") or raw.get("options") or raw.get("a")
-        ans = raw.get("answer") or raw.get("correct") or raw.get("c")
+        ans = raw.get("answer") or raw.get("correct") or raw.get("c") or raw.get("answer_index")
 
         if not q or not choices or ans is None:
             return None
 
-        choices = [str(x) for x in choices]
+        choices = [_clean_label(x) for x in choices]
         if len(choices) < 2:
             return None
         if len(choices) > 5:
             choices = choices[:5]
 
+        # answer can be index or text
         if isinstance(ans, int) and 0 <= ans < len(choices):
-            ans_text = choices[ans]
+            answer_index = ans
         else:
-            ans_text = str(ans)
+            ans_text = _clean_label(ans)
+            try:
+                answer_index = choices.index(ans_text)
+            except ValueError:
+                return None
 
-        return {"question": str(q), "choices": choices, "answer": ans_text}
+        return {"question": _clean_label(q), "choices": choices, "answer_index": answer_index}
 
+    # tuple style (q, choices, answer)
     if isinstance(raw, (list, tuple)) and len(raw) >= 3:
-        q = str(raw[0])
-        choices = [str(x) for x in raw[1]]
+        q = _clean_label(raw[0])
+        choices = [_clean_label(x) for x in raw[1]]
         ans = raw[2]
 
         if len(choices) < 2:
@@ -126,25 +134,20 @@ def _normalize_trivia(raw) -> dict | None:
             choices = choices[:5]
 
         if isinstance(ans, int) and 0 <= ans < len(choices):
-            ans_text = choices[ans]
+            answer_index = ans
         else:
-            ans_text = str(ans)
+            ans_text = _clean_label(ans)
+            try:
+                answer_index = choices.index(ans_text)
+            except ValueError:
+                return None
 
-        return {"question": q, "choices": choices, "answer": ans_text}
+        return {"question": q, "choices": choices, "answer_index": answer_index}
 
     return None
 
 
-def _is_correct(chosen: str, correct: str) -> bool:
-    if free_is_correct:
-        try:
-            return bool(free_is_correct(chosen, correct))
-        except Exception:
-            pass
-    return chosen.strip().lower() == correct.strip().lower()
-
-
-async def _announce_start(channel: discord.abc.Messageable, event_type: str, end_ts: int):
+async def _announce_start(channel: discord.abc.Messageable, event_type: str):
     title = "✅ Day Trivia Event started!" if event_type == "day" else "✅ Week Trivia Event started!"
     msg = (
         f"@everyone\n"
@@ -168,17 +171,18 @@ async def _announce_end(channel: discord.abc.Messageable, event_id: int):
 
 
 class TriviaView(discord.ui.View):
-    def __init__(self, event_id: int, question_id: str, choices: list[str], correct_answer: str):
+    def __init__(self, event_id: int, qid: str, question: str, choices: list[str], answer_index: int):
         super().__init__(timeout=ANSWER_WINDOW_SECONDS)
         self.event_id = event_id
-        self.question_id = question_id
+        self.qid = qid
+        self.question = question
         self.choices = choices
-        self.correct_answer = correct_answer
+        self.answer_index = answer_index
         self.answered_users: set[int] = set()
         self.message: discord.Message | None = None
 
-        for choice in choices:
-            self.add_item(TriviaButton(choice))
+        for idx, choice in enumerate(choices):
+            self.add_item(TriviaButton(idx, choice))
 
     async def on_timeout(self):
         for item in self.children:
@@ -193,14 +197,16 @@ class TriviaView(discord.ui.View):
 
         try:
             if self.message:
-                await self.message.channel.send(f"✅ Correct answer: **{self.correct_answer}**")
+                correct_text = self.choices[self.answer_index]
+                await self.message.channel.send(f"✅ Correct answer: **{correct_text}**")
         except Exception:
             pass
 
 
 class TriviaButton(discord.ui.Button):
-    def __init__(self, label: str):
+    def __init__(self, idx: int, label: str):
         super().__init__(style=discord.ButtonStyle.primary, label=label[:80])
+        self.idx = idx
 
     async def callback(self, interaction: discord.Interaction):
         view: TriviaView = self.view  # type: ignore
@@ -211,10 +217,7 @@ class TriviaButton(discord.ui.Button):
 
         view.answered_users.add(interaction.user.id)
 
-        chosen = self.label
-        correct = _is_correct(chosen, view.correct_answer)
-
-        if correct:
+        if self.idx == view.answer_index:
             db.add_point(view.event_id, str(interaction.user.id))
             await interaction.response.send_message("✅ Correct!", ephemeral=True)
         else:
@@ -222,13 +225,9 @@ class TriviaButton(discord.ui.Button):
 
 
 async def _get_trivia_nonrepeat(event_id: int) -> dict:
-    """
-    Returns a trivia dict guaranteed to not repeat within the event if possible.
-    Uses AI if available, otherwise fallback questions.
-    """
     # Try AI up to 3 times
     if generate_trivia:
-        for attempt in range(3):
+        for _ in range(3):
             try:
                 raw = generate_trivia()
                 if asyncio.iscoroutine(raw):
@@ -244,16 +243,19 @@ async def _get_trivia_nonrepeat(event_id: int) -> dict:
             except Exception as e:
                 print("AI_FAILED:", repr(e))
 
-    # Fallback (try to avoid repeats)
+    # Fallback questions with no repeats if possible
     for _ in range(10):
         trivia = random.choice(FALLBACK_QUESTIONS).copy()
+        trivia["question"] = _clean_label(trivia["question"])
+        trivia["choices"] = [_clean_label(c) for c in trivia["choices"]]
         qid = _qid(trivia["question"], trivia["choices"])
         if not db.event_has_question(event_id, qid):
             trivia["qid"] = qid
             return trivia
 
-    # Worst case: return something anyway (even if repeated)
     trivia = random.choice(FALLBACK_QUESTIONS).copy()
+    trivia["question"] = _clean_label(trivia["question"])
+    trivia["choices"] = [_clean_label(c) for c in trivia["choices"]]
     trivia["qid"] = _qid(trivia["question"], trivia["choices"])
     return trivia
 
@@ -269,43 +271,44 @@ async def _post_question_for_guild(guild_id: str):
     next_ask = int(event["next_ask_ts"])
     end_ts = int(event["end_ts"])
 
-    print(f"TICK guild={guild_id} event={event_id} now={now} next={next_ask} end={end_ts}")
-
     # End event
     if now >= end_ts:
         channel = await client.fetch_channel(channel_id)
         await _announce_end(channel, event_id)
         db.end_event(event_id)
-        print(f"EVENT_ENDED event={event_id}")
         return
 
     # Not time yet
     if now < next_ask:
         return
 
-    # Get non-repeating trivia
     trivia = await _get_trivia_nonrepeat(event_id)
 
-    # Record asked + schedule next
     db.record_question(event_id, trivia["qid"], now)
     db.update_next_ask(event_id, now + QUESTION_INTERVAL_SECONDS)
 
-    # Post question
     channel = await client.fetch_channel(channel_id)
 
-    embed = discord.Embed(title="🐊 Florida Gators Trivia", description=trivia["question"])
+    embed = discord.Embed(
+        title="🐊 Florida Gators Trivia",
+        description=trivia["question"]
+    )
     embed.set_footer(text=f"You have {ANSWER_WINDOW_SECONDS} seconds to answer.")
 
-    view = TriviaView(event_id=event_id, question_id=trivia["qid"], choices=trivia["choices"], correct_answer=trivia["answer"])
+    view = TriviaView(
+        event_id=event_id,
+        qid=trivia["qid"],
+        question=trivia["question"],
+        choices=trivia["choices"],
+        answer_index=int(trivia["answer_index"])
+    )
+
     msg = await channel.send(embed=embed, view=view)
     view.message = msg
-
-    print(f"POSTED event={event_id} qid={trivia['qid']}")
 
 
 async def scheduler_loop():
     await client.wait_until_ready()
-    print("SCHEDULER_STARTED")
     while not client.is_closed():
         try:
             for g in client.guilds:
@@ -315,9 +318,6 @@ async def scheduler_loop():
         await asyncio.sleep(15)
 
 
-# -------------------------
-# Slash commands
-# -------------------------
 @tree.command(name="event_day", description="Start a 24-hour trivia event (question every 5 minutes)")
 async def event_day(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -337,7 +337,7 @@ async def event_day(interaction: discord.Interaction):
     db.create_event(str(interaction.guild_id), str(channel_id), "day", now, end_ts)
 
     channel = await client.fetch_channel(int(channel_id))
-    await _announce_start(channel, "day", end_ts)
+    await _announce_start(channel, "day")
 
     await interaction.followup.send("✅ Day event started.", ephemeral=True)
 
@@ -361,7 +361,7 @@ async def event_week(interaction: discord.Interaction):
     db.create_event(str(interaction.guild_id), str(channel_id), "week", now, end_ts)
 
     channel = await client.fetch_channel(int(channel_id))
-    await _announce_start(channel, "week", end_ts)
+    await _announce_start(channel, "week")
 
     await interaction.followup.send("✅ Week event started.", ephemeral=True)
 
