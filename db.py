@@ -55,7 +55,7 @@ def init_db():
 def get_active_event(guild_id):
     with conn() as c:
         row = c.execute(
-            "SELECT * FROM events WHERE guild_id=? AND active=1 LIMIT 1",
+            "SELECT * FROM events WHERE guild_id=? AND active=1 ORDER BY id DESC LIMIT 1",
             (guild_id,)
         ).fetchone()
         return dict(row) if row else None
@@ -85,7 +85,7 @@ def update_next_ask(event_id, ts):
 def event_has_question(event_id, question_id):
     with conn() as c:
         row = c.execute(
-            "SELECT 1 FROM event_questions WHERE event_id=? AND question_id=?",
+            "SELECT 1 FROM event_questions WHERE event_id=? AND question_id=? LIMIT 1",
             (event_id, question_id)
         ).fetchone()
         return row is not None
@@ -94,8 +94,7 @@ def event_has_question(event_id, question_id):
 def record_question(event_id, question_id, ts):
     with conn() as c:
         c.execute(
-            "INSERT OR IGNORE INTO event_questions "
-            "(event_id, question_id, asked_ts) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO event_questions (event_id, question_id, asked_ts) VALUES (?, ?, ?)",
             (event_id, question_id, ts)
         )
 
@@ -119,5 +118,4 @@ def top_scores(event_id, limit=10):
             "ORDER BY points DESC LIMIT ?",
             (event_id, limit)
         ).fetchall()
-        return rows
-
+        return [(r["user_id"], r["points"]) for r in rows]
