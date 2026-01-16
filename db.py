@@ -82,7 +82,7 @@ def update_next_ask(event_id, ts):
         c.execute("UPDATE events SET next_ask_ts=? WHERE id=?", (ts, event_id))
 
 
-def event_has_question(event_id, question_id):
+def event_has_question(event_id, question_id) -> bool:
     with conn() as c:
         row = c.execute(
             "SELECT 1 FROM event_questions WHERE event_id=? AND question_id=? LIMIT 1",
@@ -91,12 +91,20 @@ def event_has_question(event_id, question_id):
         return row is not None
 
 
-def record_question(event_id, question_id, ts):
+def record_question(event_id, question_id, ts) -> bool:
+    """
+    Returns True only if we successfully recorded this as a NEW question for the event.
+    If it's a duplicate (UNIQUE constraint), returns False.
+    """
     with conn() as c:
-        c.execute(
-            "INSERT OR IGNORE INTO event_questions (event_id, question_id, asked_ts) VALUES (?, ?, ?)",
-            (event_id, question_id, ts)
-        )
+        try:
+            c.execute(
+                "INSERT INTO event_questions (event_id, question_id, asked_ts) VALUES (?, ?, ?)",
+                (event_id, question_id, ts)
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 
 def add_point(event_id, user_id):
