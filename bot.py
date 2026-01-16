@@ -96,7 +96,7 @@ async def trivia_scheduler(bot: discord.Client):
 
 
 # =============================
-# Ask Question
+# Ask Question (no repeats within event)
 # =============================
 async def post_next_question(channel: discord.abc.Messageable) -> bool:
     cid = str(channel.id)
@@ -119,7 +119,7 @@ async def post_next_question(channel: discord.abc.Messageable) -> bool:
     event_id = ev["id"] if ev else None
 
     # Try multiple times to avoid repeats
-    for _ in range(6):
+    for _ in range(8):
         try:
             payload, _ = generate_trivia(sport, game["difficulty"], game["mode"])
         except Exception as e:
@@ -135,11 +135,11 @@ async def post_next_question(channel: discord.abc.Messageable) -> bool:
         if event_id is not None and db.event_has_question(event_id, qhash):
             continue
 
-        # Accept question
+        # Accept question for event
         if event_id is not None:
             db.add_event_question(event_id, qhash)
 
-        # store question
+        # Store question
         if payload["type"] == "mcq":
             answer_key = payload["choices"][int(payload["answer_index"])]
         else:
@@ -159,6 +159,7 @@ async def post_next_question(channel: discord.abc.Messageable) -> bool:
         if payload["type"] == "mcq":
             for lbl, opt in zip(["A", "B", "C", "D"], payload["choices"]):
                 embed.add_field(name=lbl, value=opt, inline=False)
+
             view = MCQView(cid, qid, ANSWER_SECONDS)
             msg = await channel.send(embed=embed, view=view)
             view.message = msg
@@ -169,12 +170,11 @@ async def post_next_question(channel: discord.abc.Messageable) -> bool:
 
         return True
 
-    # If we can't get a non-repeat after several tries, just skip this cycle
     return False
 
 
 # =============================
-# Views (disable buttons on timeout)
+# Views (disable buttons + reveal correct answer on timeout)
 # =============================
 class MCQView(discord.ui.View):
     def __init__(self, channel_id: str, qid: int, timeout: int):
@@ -186,14 +186,34 @@ class MCQView(discord.ui.View):
 
     async def on_timeout(self):
         try:
+            # Disable buttons
             for item in self.children:
                 item.disabled = True
             if self.message:
                 await self.message.edit(view=self)
+
+            # If nobody answered, reveal correct answer
+            if len(self.answered) == 0 and self.message:
+                q = db.get_question(self.qid)
+                payload = q["payload"]
+                correct_idx = int(payload["answer_index"])
+                correct_text = payload["choices"][correct_idx]
+                expl = payload.get("explanation", "")
+
+                out = f"⏰ **Time!** Correct answer: **{correct_text}**"
+                if expl:
+                    out += f"\n{expl}"
+                await self.message.channel.send(out)
+
         except Exception as e:
-            print("VIEW_TIMEOUT_EDIT_FAILED:", repr(e))
+            print("VIEW_TIMEOUT_FAILED:", repr(e))
 
     async def handle(self, interaction: discord.Interaction, idx: int):
+        # If timed out and buttons somehow still clicked
+        if self.is_finished():
+            await interaction.response.send_message("⏰ Too late — time expired.", ephemeral=True)
+            return
+
         if interaction.user.id in self.answered:
             await interaction.response.send_message("Already answered.", ephemeral=True)
             return
@@ -212,7 +232,7 @@ class MCQView(discord.ui.View):
 
         correct_text = payload["choices"][int(payload["answer_index"])]
         msg = "✅ Correct!" if correct else f"❌ Wrong. Correct: **{correct_text}**"
-        await interaction.response.send_message(msg, ephemeral=False)
+        await interaction.response.send_message(msg)
 
     @discord.ui.button(label="A", style=discord.ButtonStyle.primary)
     async def a(self, i, _): await self.handle(i, 0)
@@ -263,16 +283,22 @@ class FreeView(discord.ui.View):
                 item.disabled = True
             if self.message:
                 await self.message.edit(view=self)
+
+            # We can't reliably tell if nobody answered in free-mode without extra wiring,
+            # so we do NOT auto-reveal here by default.
         except Exception as e:
-            print("VIEW_TIMEOUT_EDIT_FAILED:", repr(e))
+            print("FREE_VIEW_TIMEOUT_FAILED:", repr(e))
 
     @discord.ui.button(label="Submit Answer", style=discord.ButtonStyle.primary)
     async def submit(self, interaction, _):
+        if self.is_finished():
+            await interaction.response.send_message("⏰ Too late — time expired.", ephemeral=True)
+            return
         await interaction.response.send_modal(FreeAnswerModal(self.channel_id, self.qid))
 
 
 # =============================
-# Commands (NO TIME INPUTS)
+# Commands (no time inputs)
 # =============================
 class TriviaCog(app_commands.Group):
     def __init__(self):
@@ -320,7 +346,8 @@ class TriviaCog(app_commands.Group):
             "✅ **Day Trivia Event started!**\n"
             "⏱️ **30 seconds** to answer\n"
             "🕔 **Every 5 minutes**\n"
-            "🏆 **@everyone + Top 10** posted at the end"
+            "🏆 **@everyone + Top 10** posted at the end\n"
+            "⏰ If nobody answers in time, the correct answer will be posted."
         )
 
     @app_commands.command(name="event_week", description="7-day event: question every 30 minutes, top 10 @everyone at end")
@@ -349,7 +376,8 @@ class TriviaCog(app_commands.Group):
             "✅ **Week Trivia Event started!**\n"
             "⏱️ **30 seconds** to answer\n"
             "🕧 **Every 30 minutes**\n"
-            "🏆 **@everyone + Top 10** posted at the end"
+            "🏆 **@everyone + Top 10** posted at the end\n"
+            "⏰ If nobody answers in time, the correct answer will be posted."
         )
 
     @app_commands.command(name="event_stop", description="Stop the active event in this channel")
@@ -404,6 +432,12 @@ def main():
     import config
     db.init_db()
     bot = GatorTriviaBot()
+    bot.run(config.DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
+
     bot.run(config.DISCORD_TOKEN)
 
 
