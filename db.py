@@ -1,4 +1,5 @@
 import sqlite3
+import random
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -63,6 +64,125 @@ def init_db():
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_grq_guild_id_id ON guild_recent_questions(guild_id, id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_grq_guild_qid ON guild_recent_questions(guild_id, question_id)")
+
+        # Global question bank (generated or imported). This is how we scale to 10k+ questions.
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS question_bank ("
+            "question_id TEXT PRIMARY KEY, "
+            "sport TEXT NOT NULL, "
+            "difficulty TEXT NOT NULL, "
+            "question TEXT NOT NULL, "
+            "choices_json TEXT NOT NULL, "
+            "answer_index INTEGER NOT NULL, "
+            "explanation TEXT, "
+            "tags_json TEXT, "
+            "created_ts INTEGER NOT NULL"
+            ")"
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_qb_sport_diff ON question_bank(sport, difficulty)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_qb_created_ts ON question_bank(created_ts)")
+
+
+def upsert_question_bank(
+    question_id: str,
+    sport: str,
+    difficulty: str,
+    question: str,
+    choices: list[str],
+    answer_index: int,
+    explanation: str | None,
+    tags: list[str] | None,
+    created_ts: int,
+) -> bool:
+    """Insert question into the global bank if it doesn't exist. Returns True if inserted."""
+    import json
+
+    with conn() as c:
+        try:
+            c.execute(
+                "INSERT INTO question_bank (question_id, sport, difficulty, question, choices_json, answer_index, explanation, tags_json, created_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    question_id,
+                    sport,
+                    difficulty,
+                    question,
+                    json.dumps(choices, ensure_ascii=False),
+                    int(answer_index),
+                    explanation or "",
+                    json.dumps(tags or [], ensure_ascii=False),
+                    int(created_ts),
+                ),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def question_bank_count() -> int:
+    with conn() as c:
+        row = c.execute("SELECT COUNT(1) AS n FROM question_bank").fetchone()
+        return int(row["n"]) if row else 0
+
+
+def pick_question_from_bank(
+    guild_id: str,
+    event_id: int,
+    recent_window: int,
+    sport: str | None = None,
+    difficulty: str | None = None,
+):
+    """Return a question dict from bank that is not used in this event and not in recent window."""
+    import json
+
+    params = []
+    where = []
+    if sport:
+        where.append("sport=?")
+        params.append(sport)
+    if difficulty:
+        where.append("difficulty=?")
+        params.append(difficulty)
+
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+
+    with conn() as c:
+        rows = c.execute(
+            f"SELECT question_id, sport, difficulty, question, choices_json, answer_index, explanation, tags_json "
+            f"FROM question_bank {where_sql} ORDER BY created_ts DESC LIMIT 400",
+            tuple(params),
+        ).fetchall()
+
+        if not rows:
+            return None
+
+        candidates = []
+        for r in rows:
+            qid = r["question_id"]
+            used = c.execute(
+                "SELECT 1 FROM event_questions WHERE event_id=? AND question_id=? LIMIT 1",
+                (event_id, qid),
+            ).fetchone()
+            if used:
+                continue
+            if guild_recent_has(guild_id, qid, recent_window):
+                continue
+            candidates.append(r)
+
+        if not candidates:
+            return None
+
+        r = random.choice(candidates)
+        return {
+            "question_id": r["question_id"],
+            "sport": r["sport"],
+            "difficulty": r["difficulty"],
+            "question": r["question"],
+            "choices": json.loads(r["choices_json"]),
+            "answer_index": int(r["answer_index"]),
+            "explanation": r["explanation"] or "",
+            "tags": json.loads(r["tags_json"] or "[]"),
+        }
 
 
 def get_active_event(guild_id):
