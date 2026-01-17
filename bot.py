@@ -4,7 +4,7 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).with_name("trivia.db")
 
-print("DB_LOADED:", __file__)  # proves which db.py Railway imported
+print("DB_LOADED:", __file__)
 
 
 @contextmanager
@@ -32,7 +32,6 @@ def init_db():
             "active INTEGER NOT NULL DEFAULT 1"
             ")"
         )
-
         c.execute(
             "CREATE TABLE IF NOT EXISTS event_questions ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -42,7 +41,6 @@ def init_db():
             "UNIQUE(event_id, question_id)"
             ")"
         )
-
         c.execute(
             "CREATE TABLE IF NOT EXISTS scores ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -52,7 +50,6 @@ def init_db():
             "UNIQUE(event_id, user_id)"
             ")"
         )
-
         c.execute(
             "CREATE TABLE IF NOT EXISTS guild_recent_questions ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -126,7 +123,7 @@ def top_scores(event_id, limit=10):
         return [(r["user_id"], r["points"]) for r in rows]
 
 
-# ---------- recent-window helpers ----------
+# Recent-window helpers
 def guild_recent_count(guild_id: str) -> int:
     with conn() as c:
         row = c.execute(
@@ -143,9 +140,7 @@ def guild_recent_has(guild_id: str, question_id: str, window_size: int) -> bool:
         row = c.execute(
             "SELECT 1 FROM guild_recent_questions "
             "WHERE guild_id=? AND question_id=? "
-            "AND id >= ("
-            "  SELECT COALESCE(MAX(id) - ? + 1, 0) FROM guild_recent_questions WHERE guild_id=?"
-            ") "
+            "AND id >= (SELECT COALESCE(MAX(id) - ? + 1, 0) FROM guild_recent_questions WHERE guild_id=?) "
             "LIMIT 1",
             (guild_id, question_id, window_size, guild_id),
         ).fetchone()
@@ -158,11 +153,8 @@ def guild_recent_add(guild_id: str, question_id: str, ts: int, window_size: int)
             "INSERT INTO guild_recent_questions (guild_id, question_id, asked_ts) VALUES (?, ?, ?)",
             (guild_id, question_id, ts),
         )
-        # trim to last window_size rows
         c.execute(
             "DELETE FROM guild_recent_questions "
-            "WHERE guild_id=? AND id < ("
-            "  SELECT COALESCE(MAX(id) - ? + 1, 0) FROM guild_recent_questions WHERE guild_id=?"
-            ")",
+            "WHERE guild_id=? AND id < (SELECT COALESCE(MAX(id) - ? + 1, 0) FROM guild_recent_questions WHERE guild_id=?)",
             (guild_id, window_size, guild_id),
         )
