@@ -4,6 +4,8 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).with_name("trivia.db")
 
+print("DB_LOADED:", __file__)
+
 
 @contextmanager
 def conn():
@@ -30,7 +32,6 @@ def init_db():
             "active INTEGER NOT NULL DEFAULT 1"
             ")"
         )
-
         c.execute(
             "CREATE TABLE IF NOT EXISTS event_questions ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -40,7 +41,6 @@ def init_db():
             "UNIQUE(event_id, question_id)"
             ")"
         )
-
         c.execute(
             "CREATE TABLE IF NOT EXISTS scores ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -50,13 +50,23 @@ def init_db():
             "UNIQUE(event_id, user_id)"
             ")"
         )
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS guild_recent_questions ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "guild_id TEXT NOT NULL, "
+            "question_id TEXT NOT NULL, "
+            "asked_ts INTEGER NOT NULL"
+            ")"
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_grq_guild_id_id ON guild_recent_questions(guild_id, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_grq_guild_qid ON guild_recent_questions(guild_id, question_id)")
 
 
 def get_active_event(guild_id):
     with conn() as c:
         row = c.execute(
             "SELECT * FROM events WHERE guild_id=? AND active=1 ORDER BY id DESC LIMIT 1",
-            (guild_id,)
+            (guild_id,),
         ).fetchone()
         return dict(row) if row else None
 
@@ -67,7 +77,7 @@ def create_event(guild_id, channel_id, event_type, start_ts, end_ts):
             "INSERT INTO events "
             "(guild_id, channel_id, event_type, start_ts, end_ts, next_ask_ts, active) "
             "VALUES (?, ?, ?, ?, ?, ?, 1)",
-            (guild_id, channel_id, event_type, start_ts, end_ts, start_ts)
+            (guild_id, channel_id, event_type, start_ts, end_ts, start_ts),
         )
         return cur.lastrowid
 
@@ -82,25 +92,12 @@ def update_next_ask(event_id, ts):
         c.execute("UPDATE events SET next_ask_ts=? WHERE id=?", (ts, event_id))
 
 
-def event_has_question(event_id, question_id) -> bool:
-    with conn() as c:
-        row = c.execute(
-            "SELECT 1 FROM event_questions WHERE event_id=? AND question_id=? LIMIT 1",
-            (event_id, question_id)
-        ).fetchone()
-        return row is not None
-
-
 def record_question(event_id, question_id, ts) -> bool:
-    """
-    Returns True only if we successfully recorded this as a NEW question for the event.
-    If it's a duplicate (UNIQUE constraint), returns False.
-    """
     with conn() as c:
         try:
             c.execute(
                 "INSERT INTO event_questions (event_id, question_id, asked_ts) VALUES (?, ?, ?)",
-                (event_id, question_id, ts)
+                (event_id, question_id, ts),
             )
             return True
         except sqlite3.IntegrityError:
@@ -112,18 +109,54 @@ def add_point(event_id, user_id):
         c.execute(
             "INSERT INTO scores (event_id, user_id, points) "
             "VALUES (?, ?, 1) "
-            "ON CONFLICT(event_id, user_id) "
-            "DO UPDATE SET points = points + 1",
-            (event_id, user_id)
+            "ON CONFLICT(event_id, user_id) DO UPDATE SET points = points + 1",
+            (event_id, user_id),
         )
 
 
 def top_scores(event_id, limit=10):
     with conn() as c:
         rows = c.execute(
-            "SELECT user_id, points FROM scores "
-            "WHERE event_id=? "
-            "ORDER BY points DESC LIMIT ?",
-            (event_id, limit)
+            "SELECT user_id, points FROM scores WHERE event_id=? ORDER BY points DESC LIMIT ?",
+            (event_id, limit),
         ).fetchall()
         return [(r["user_id"], r["points"]) for r in rows]
+
+
+# Recent-window helpers
+def guild_recent_count(guild_id: str) -> int:
+    with conn() as c:
+        row = c.execute(
+            "SELECT COUNT(1) AS n FROM guild_recent_questions WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+
+def guild_recent_has(guild_id: str, question_id: str, window_size: int) -> bool:
+    if window_size <= 0:
+        return False
+    with conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM guild_recent_questions "
+            "WHERE guild_id=? AND question_id=? "
+            "AND id >= (SELECT COALESCE(MAX(id) - ? + 1, 0) FROM guild_recent_questions WHERE guild_id=?) "
+            "LIMIT 1",
+            (guild_id, question_id, window_size, guild_id),
+        ).fetchone()
+        return row is not None
+
+
+def guild_recent_add(guild_id: str, question_id: str, ts: int, window_size: int):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO guild_recent_questions (guild_id, question_id, asked_ts) VALUES (?, ?, ?)",
+            (guild_id, question_id, ts),
+        )
+        c.execute(
+            "DELETE FROM guild_recent_questions "
+            "WHERE guild_id=? AND id < (SELECT COALESCE(MAX(id) - ? + 1, 0) FROM guild_recent_questions WHERE guild_id=?)",
+            (guild_id, window_size, guild_id),
+        )
+
+
