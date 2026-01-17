@@ -19,40 +19,57 @@ TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or os.getenv("BOT_TOKEN
 if not TOKEN:
     raise RuntimeError("Missing bot token. Set Railway Variable: DISCORD_TOKEN (or TOKEN / BOT_TOKEN).")
 
-TRIVIA_CHANNEL_ID = os.getenv("TRIVIA_CHANNEL_ID")  # optional override
+TRIVIA_CHANNEL_ID = os.getenv("TRIVIA_CHANNEL_ID")
 QUESTION_INTERVAL_SECONDS = 5 * 60
 ANSWER_WINDOW_SECONDS = 30
 
+# "No-repeat for last N" target; code auto-scales early
+RECENT_WINDOW = 1000
+
+SPORTS = [
+    "football",
+    "men's basketball",
+    "women's basketball",
+    "baseball",
+    "softball",
+    "gymnastics",
+    "track & field",
+    "swimming & diving",
+    "lacrosse",
+    "soccer",
+]
+DIFFICULTIES = ["easy", "medium", "hard", "expert"]
+DIFFICULTY_WEIGHTS = [0.35, 0.35, 0.22, 0.08]
+
 db.init_db()
 
-FALLBACK_QUESTIONS = [
-    {
-        "question": "What year did Florida win its first football national championship?",
-        "choices": ["1992", "1996", "2006", "2008"],
-        "answer_index": 1,
-    },
-    {
-        "question": "What is the nickname of Ben Hill Griffin Stadium?",
-        "choices": ["The Swamp", "Death Valley", "The Horseshoe", "The Big House"],
-        "answer_index": 0,
-    },
-    {
-        "question": "Which conference do the Florida Gators compete in?",
-        "choices": ["SEC", "ACC", "Big Ten", "Big 12"],
-        "answer_index": 0,
-    },
-    {
-        "question": "Who is Florida’s biggest in-state rival (commonly)?",
-        "choices": ["FSU", "Miami", "UCF", "FAU"],
-        "answer_index": 0,
-    },
+# Bigger fallback bank prevents "ran out" when AI is flaky.
+FALLBACK_BANK = [
+    # Football
+    {"sport":"football","difficulty":"easy","question":"What is the nickname of Ben Hill Griffin Stadium?","choices":["The Swamp","Death Valley","The Horseshoe","The Big House"],"answer_index":0},
+    {"sport":"football","difficulty":"easy","question":"What conference do the Florida Gators play in?","choices":["SEC","ACC","Big Ten","Big 12"],"answer_index":0},
+    {"sport":"football","difficulty":"medium","question":"Who was Florida’s head coach for the 1996 national championship season?","choices":["Steve Spurrier","Urban Meyer","Ron Zook","Jim McElwain"],"answer_index":0},
+    {"sport":"football","difficulty":"medium","question":"Florida won national championships in football in which two seasons?","choices":["1996 and 2008","2006 and 2012","1984 and 1992","2015 and 2020"],"answer_index":0},
+
+    # Men's Basketball
+    {"sport":"men's basketball","difficulty":"easy","question":"Florida won back-to-back NCAA men’s basketball titles in which years?","choices":["2006 and 2007","2004 and 2005","2007 and 2008","2005 and 2006"],"answer_index":0},
+    {"sport":"men's basketball","difficulty":"medium","question":"Who coached Florida’s men’s basketball teams to the 2006 and 2007 titles?","choices":["Billy Donovan","Mike White","Lon Kruger","Todd Golden"],"answer_index":0},
+
+    # Baseball
+    {"sport":"baseball","difficulty":"easy","question":"What is the name of Florida’s baseball stadium?","choices":["Condron Ballpark","Ben Hill Griffin Stadium","Exactech Arena","Pressly Stadium"],"answer_index":0},
+    {"sport":"baseball","difficulty":"medium","question":"Florida won the College World Series national title in which year?","choices":["2017","2015","2005","2021"],"answer_index":0},
+
+    # Softball
+    {"sport":"softball","difficulty":"easy","question":"What is the name of Florida’s softball stadium?","choices":["Katie Seashole Pressly Stadium","Condron Ballpark","O'Connell Center","Phillips Arena"],"answer_index":0},
+
+    # Gymnastics
+    {"sport":"gymnastics","difficulty":"easy","question":"Florida gymnastics is commonly referred to as what?","choices":["Gators Gym","Swamp Flyers","Orange Elite","UF Tumblers"],"answer_index":0},
 ]
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Per-guild lock to prevent double-post race (start command + scheduler tick)
 GUILD_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -94,16 +111,63 @@ async def _safe_fetch_channel(channel_id: int):
         return None
 
 
+def _validate_trivia(trivia: dict) -> dict | None:
+    try:
+        q = _clean(trivia["question"])
+        choices = [_clean(c) for c in trivia["choices"]]
+        ans = int(trivia["answer_index"])
+        if len(choices) != 4:
+            return None
+        if ans < 0 or ans > 3:
+            return None
+        if any(c.strip() == "" or c.strip() == "?" for c in choices):
+            return None
+        if choices[ans].strip() in {"", "?"}:
+            return None
+        if len(set(c.lower() for c in choices)) != 4:
+            return None
+        sport = _clean(trivia.get("sport", "")) or "football"
+        difficulty = _clean(trivia.get("difficulty", "")) or "medium"
+        return {"question": q, "choices": choices, "answer_index": ans, "sport": sport, "difficulty": difficulty}
+    except Exception:
+        return None
+
+
+async def _get_question_candidate() -> dict | None:
+    sport = random.choice(SPORTS)
+    difficulty = random.choices(DIFFICULTIES, weights=DIFFICULTY_WEIGHTS, k=1)[0]
+
+    # AI first
+    if generate_trivia:
+        try:
+            out = None
+            try:
+                out = generate_trivia(sport=sport, difficulty=difficulty)
+            except TypeError:
+                out = generate_trivia()
+            if asyncio.iscoroutine(out):
+                out = await out
+            if isinstance(out, dict):
+                v = _validate_trivia(out)
+                if v:
+                    return v
+        except Exception as e:
+            print("AI_TRIVIA_ERROR:", repr(e))
+
+    # Fallback
+    fb = random.choice(FALLBACK_BANK).copy()
+    return _validate_trivia(fb)
+
+
 async def _announce_start(channel: discord.abc.Messageable, event_type: str):
     title = "✅ Day Trivia Event started!" if event_type == "day" else "✅ Week Trivia Event started!"
-    msg = (
-        f"@everyone\n"
+    await channel.send(
+        "@everyone\n"
         f"**{title}**\n"
-        f"⏱️ 30 seconds to answer\n"
-        f"🕔 Every 5 minutes\n"
-        f"🏆 Top 10 posted at the end"
+        "⏱️ 30 seconds to answer\n"
+        "🕔 Every 5 minutes\n"
+        "🏆 Top 10 posted at the end"
     )
-    await channel.send(msg)
 
 
 async def _announce_end(channel: discord.abc.Messageable, event_id: int):
@@ -169,68 +233,7 @@ class TriviaButton(discord.ui.Button):
             await interaction.response.send_message("❌ Wrong!", ephemeral=True)
 
 
-def _normalize_trivia(raw) -> dict | None:
-    """
-    Output:
-      {question:str, choices:[str], answer_index:int}
-    """
-    if raw is None:
-        return None
-
-    if isinstance(raw, dict):
-        q = raw.get("question") or raw.get("q")
-        choices = raw.get("choices") or raw.get("answers") or raw.get("options") or raw.get("a")
-        ans = raw.get("answer_index") or raw.get("answer") or raw.get("correct") or raw.get("c")
-
-        if not q or not choices or ans is None:
-            return None
-
-        q = _clean(q)
-        choices = [_clean(x) for x in choices]
-        if len(choices) < 2:
-            return None
-        if len(choices) > 5:
-            choices = choices[:5]
-
-        if isinstance(ans, int) and 0 <= ans < len(choices):
-            answer_index = ans
-        else:
-            ans_text = _clean(ans)
-            try:
-                answer_index = choices.index(ans_text)
-            except ValueError:
-                return None
-
-        return {"question": q, "choices": choices, "answer_index": answer_index}
-
-    return None
-
-
-async def _pick_trivia(event_id: int) -> dict:
-    # Try AI first
-    if generate_trivia:
-        for _ in range(5):
-            try:
-                raw = generate_trivia()
-                if asyncio.iscoroutine(raw):
-                    raw = await raw
-                trivia = _normalize_trivia(raw)
-                if trivia:
-                    trivia["qid"] = _qid(trivia["question"], trivia["choices"])
-                    return trivia
-            except Exception as e:
-                print("AI_FAILED:", repr(e))
-
-    # Fallback
-    trivia = random.choice(FALLBACK_QUESTIONS).copy()
-    trivia["question"] = _clean(trivia["question"])
-    trivia["choices"] = [_clean(c) for c in trivia["choices"]]
-    trivia["qid"] = _qid(trivia["question"], trivia["choices"])
-    return trivia
-
-
 async def _post_question_for_guild(guild_id: str):
-    # Prevent double-post race per guild
     async with _lock_for_guild(guild_id):
         event = db.get_active_event(guild_id)
         if not event:
@@ -254,43 +257,76 @@ async def _post_question_for_guild(guild_id: str):
 
         channel = await _safe_fetch_channel(channel_id)
         if not channel:
-            print(f"POST_BLOCKED guild={guild_id} event={event_id} channel={channel_id}")
             db.update_next_ask(event_id, now + 60)
             return
 
-        # HARD guarantee: record in DB first, only post if DB accepts it as new.
-        # We’ll try multiple pulls to find a non-duplicate.
-        posted = False
-        for _ in range(12):
-            trivia = await _pick_trivia(event_id)
-            qid = trivia["qid"]
+        # Smart window scaling (prevents early choking)
+        recent_count = db.guild_recent_count(guild_id)
+        effective_window = min(RECENT_WINDOW, recent_count)
 
-            # If record_question returns False, it's a duplicate -> DO NOT POST.
+        # Try hard with rules
+        for attempt in range(40):
+            trivia = await _get_question_candidate()
+            if not trivia:
+                continue
+
+            qid = _qid(trivia["question"], trivia["choices"])
+
+            # Rule 1: not used recently (scaled window)
+            if effective_window > 0 and db.guild_recent_has(guild_id, qid, effective_window):
+                continue
+
+            # Rule 2: not already used in this event
             if not db.record_question(event_id, qid, now):
                 continue
 
-            # Now safe to post (unique within event)
+            # Record in recent history (full target window)
+            db.guild_recent_add(guild_id, qid, now, RECENT_WINDOW)
+
             db.update_next_ask(event_id, now + QUESTION_INTERVAL_SECONDS)
 
             embed = discord.Embed(title="🐊 Florida Gators Trivia", description=trivia["question"])
-            embed.set_footer(text=f"You have {ANSWER_WINDOW_SECONDS} seconds to answer.")
+            embed.set_footer(
+                text=f"Sport: {trivia.get('sport','')} • Difficulty: {trivia.get('difficulty','')} • "
+                     f"You have {ANSWER_WINDOW_SECONDS} seconds to answer."
+            )
 
-            view = TriviaView(event_id, trivia["choices"], int(trivia["answer_index"]))
+            view = TriviaView(event_id, trivia["choices"], trivia["answer_index"])
             msg = await channel.send(embed=embed, view=view)
             view.message = msg
+            return
 
-            posted = True
-            break
+        # If we got here, we're boxed in. Relax rule instead of stalling:
+        # Allow repeats beyond the recent window, but still enforce "no duplicates within this event".
+        for attempt in range(40):
+            trivia = await _get_question_candidate()
+            if not trivia:
+                continue
+            qid = _qid(trivia["question"], trivia["choices"])
+            if not db.record_question(event_id, qid, now):
+                continue
 
-        if not posted:
-            # If we somehow can't find a new question, try again later.
-            db.update_next_ask(event_id, now + 60)
-            await channel.send("⚠️ Ran out of new questions for this event (temporarily). Trying again soon.")
+            db.guild_recent_add(guild_id, qid, now, RECENT_WINDOW)
+            db.update_next_ask(event_id, now + QUESTION_INTERVAL_SECONDS)
+
+            embed = discord.Embed(title="🐊 Florida Gators Trivia", description=trivia["question"])
+            embed.set_footer(
+                text=f"Sport: {trivia.get('sport','')} • Difficulty: {trivia.get('difficulty','')} • "
+                     f"You have {ANSWER_WINDOW_SECONDS} seconds to answer."
+            )
+
+            view = TriviaView(event_id, trivia["choices"], trivia["answer_index"])
+            msg = await channel.send(embed=embed, view=view)
+            view.message = msg
+            return
+
+        # Absolute last resort
+        db.update_next_ask(event_id, now + 60)
+        await channel.send("⚠️ Couldn’t generate a valid question right now. Trying again in 60 seconds.")
 
 
 async def scheduler_loop():
     await client.wait_until_ready()
-    print("SCHEDULER_STARTED")
     while not client.is_closed():
         for g in client.guilds:
             try:
@@ -317,18 +353,9 @@ async def event_day(interaction: discord.Interaction):
     end_ts = now + 24 * 60 * 60
 
     db.create_event(str(interaction.guild_id), str(channel_id), "day", now, end_ts)
+    await _announce_start(interaction.channel, "day")
 
-    try:
-        await _announce_start(interaction.channel, "day")
-    except Exception as e:
-        print("START_ANNOUNCE_FAILED:", repr(e))
-
-    # Post first question immediately (safe; lock prevents race)
-    try:
-        await _post_question_for_guild(str(interaction.guild_id))
-    except Exception as e:
-        print("START_POST_FIRST_FAILED:", repr(e))
-
+    await _post_question_for_guild(str(interaction.guild_id))
     await interaction.followup.send("✅ Day event started.", ephemeral=True)
 
 
@@ -349,18 +376,9 @@ async def event_week(interaction: discord.Interaction):
     end_ts = now + 7 * 24 * 60 * 60
 
     db.create_event(str(interaction.guild_id), str(channel_id), "week", now, end_ts)
+    await _announce_start(interaction.channel, "week")
 
-    try:
-        await _announce_start(interaction.channel, "week")
-    except Exception as e:
-        print("START_ANNOUNCE_FAILED:", repr(e))
-
-    # Post first question immediately (safe; lock prevents race)
-    try:
-        await _post_question_for_guild(str(interaction.guild_id))
-    except Exception as e:
-        print("START_POST_FIRST_FAILED:", repr(e))
-
+    await _post_question_for_guild(str(interaction.guild_id))
     await interaction.followup.send("✅ Week event started.", ephemeral=True)
 
 
@@ -391,31 +409,6 @@ async def stop(interaction: discord.Interaction):
     await interaction.followup.send("✅ Event stopped.", ephemeral=True)
 
 
-@tree.command(name="status", description="Show event status")
-async def status(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    if not interaction.guild_id:
-        await interaction.followup.send("Use this in a server.", ephemeral=True)
-        return
-
-    event = db.get_active_event(str(interaction.guild_id))
-    if not event:
-        await interaction.followup.send("No active event.", ephemeral=True)
-        return
-
-    now = _now()
-    ends_in = max(0, int(event["end_ts"]) - now)
-    next_in = max(0, int(event["next_ask_ts"]) - now)
-
-    await interaction.followup.send(
-        f"Active: **{event['event_type']}**\n"
-        f"Ends in: **{ends_in // 3600}h {(ends_in % 3600) // 60}m**\n"
-        f"Next question in: **{next_in // 60}m {next_in % 60}s**",
-        ephemeral=True
-    )
-
-
 @client.event
 async def on_ready():
     await tree.sync()
@@ -424,4 +417,3 @@ async def on_ready():
 
 
 client.run(TOKEN)
-
