@@ -32,6 +32,7 @@ def init_db():
             "active INTEGER NOT NULL DEFAULT 1"
             ")"
         )
+
         c.execute(
             "CREATE TABLE IF NOT EXISTS event_questions ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -41,6 +42,7 @@ def init_db():
             "UNIQUE(event_id, question_id)"
             ")"
         )
+
         c.execute(
             "CREATE TABLE IF NOT EXISTS scores ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -50,6 +52,7 @@ def init_db():
             "UNIQUE(event_id, user_id)"
             ")"
         )
+
         c.execute(
             "CREATE TABLE IF NOT EXISTS guild_recent_questions ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -123,7 +126,7 @@ def top_scores(event_id, limit=10):
         return [(r["user_id"], r["points"]) for r in rows]
 
 
-# Recent-window helpers
+# ---------- recent-window helpers ----------
 def guild_recent_count(guild_id: str) -> int:
     with conn() as c:
         row = c.execute(
@@ -158,5 +161,3 @@ def guild_recent_add(guild_id: str, question_id: str, ts: int, window_size: int)
             "WHERE guild_id=? AND id < (SELECT COALESCE(MAX(id) - ? + 1, 0) FROM guild_recent_questions WHERE guild_id=?)",
             (guild_id, window_size, guild_id),
         )
-
-
