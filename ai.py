@@ -42,10 +42,12 @@ def _responses_api_call(payload: dict, timeout: int = 30) -> dict:
 
 
 def _extract_output_text(obj: dict) -> str:
+    # Responses API convenience field
     output_text = (obj.get("output_text") or "").strip()
     if output_text:
         return output_text
 
+    # Fallback: structured outputs
     chunks = []
     for item in obj.get("output", []) or []:
         for c in item.get("content", []) or []:
@@ -65,6 +67,8 @@ def generate_trivia(
 
     trivia_dict MCQ schema:
       {sport,difficulty,type:'mcq',question,choices:[4],answer_index,explanation,tags:[...],confidence:0-1}
+
+    NOTE: This function is intentionally synchronous (uses urllib) to keep dependencies minimal.
     """
 
     requested_type = "mcq" if (mode or "").lower() != "free" else "free"
@@ -73,6 +77,8 @@ def generate_trivia(
         "You write University of Florida (Florida Gators) athletics trivia.\n"
         "You MUST cover the full UF athletics universe across time: football, men's/women's basketball, baseball, softball, gymnastics, track & field, swimming & diving, soccer, lacrosse, volleyball, tennis, golf, cross country, rowing, and other UF varsity sports.\n"
         "ALSO include: (A) recruiting trivia (HS commits, signing classes, positions, star ratings, flips, coaching staff, eras), and (B) Florida/UF athletes in the Olympics (UF alums and Florida athletes associated with UF, medals, events, years).\n"
+        "Make the questions CHALLENGING by default. Avoid ultra-basic trivia like: conference name, mascot, school colors, stadium nickname, or other 101-level facts.\n"
+        "Prefer deep-cut but verifiable questions: specific years, opponents, coaches, award winners, records, postseason results, recruiting class details, and Olympic medals/events.\n"
         "Keep questions specific and answerable. Avoid obscure unverifiable rumors. Prefer facts a fan could verify (names, years, awards, titles, venues, records, coaches, notable games/performances).\n"
     )
 
@@ -89,7 +95,9 @@ def generate_trivia(
         "- answer_index must match the correct choice\n"
     )
 
-    topic_hint = f"Focus topic: {topic}.\n" if topic else ""
+    topic_hint = ""
+    if topic:
+        topic_hint = f"Focus topic: {topic}.\n"
 
     payload = {
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -114,4 +122,3 @@ def generate_trivia(
 
     h = _hash_payload(trivia)
     return trivia, h
-
