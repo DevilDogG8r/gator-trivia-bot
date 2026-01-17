@@ -3,6 +3,7 @@ import time
 import asyncio
 import random
 import hashlib
+import re
 
 import discord
 from discord import app_commands
@@ -41,11 +42,15 @@ DIFFICULTY_WEIGHTS = [0.35, 0.35, 0.22, 0.08]
 
 db.init_db()
 
+# Keep fallback, but duplicates are now controlled by canonical question hash.
 FALLBACK_BANK = [
     {"sport":"football","difficulty":"easy","question":"What is the nickname of Ben Hill Griffin Stadium?","choices":["The Swamp","Death Valley","The Horseshoe","The Big House"],"answer_index":0},
     {"sport":"football","difficulty":"easy","question":"What conference do the Florida Gators play in?","choices":["SEC","ACC","Big Ten","Big 12"],"answer_index":0},
-    {"sport":"football","difficulty":"medium","question":"Who was Florida’s head coach for the 1996 national championship season?","choices":["Steve Spurrier","Urban Meyer","Ron Zook","Jim McElwain"],"answer_index":0},
-    {"sport":"men's basketball","difficulty":"easy","question":"Florida won back-to-back NCAA men’s basketball titles in which years?","choices":["2006 and 2007","2004 and 2005","2007 and 2008","2005 and 2006"],"answer_index":0},
+    {"sport":"football","difficulty":"medium","question":"Who coached Florida to the 1996 football national championship?","choices":["Steve Spurrier","Urban Meyer","Ron Zook","Jim McElwain"],"answer_index":0},
+    {"sport":"football","difficulty":"medium","question":"Florida won football national titles in which seasons?","choices":["1996 and 2008","2006 and 2007","1984 and 1992","2016 and 2020"],"answer_index":0},
+    {"sport":"men's basketball","difficulty":"easy","question":"Florida won back-to-back NCAA men's basketball titles in which years?","choices":["2006 and 2007","2004 and 2005","2007 and 2008","2005 and 2006"],"answer_index":0},
+    {"sport":"men's basketball","difficulty":"medium","question":"Who coached Florida’s men’s basketball teams to the 2006 and 2007 titles?","choices":["Billy Donovan","Mike White","Lon Kruger","Todd Golden"],"answer_index":0},
+    {"sport":"baseball","difficulty":"easy","question":"What is the name of Florida’s baseball stadium?","choices":["Condron Ballpark","Ben Hill Griffin Stadium","O'Connell Center","Pressly Stadium"],"answer_index":0},
     {"sport":"baseball","difficulty":"medium","question":"Florida won the College World Series national title in which year?","choices":["2017","2015","2005","2021"],"answer_index":0},
     {"sport":"softball","difficulty":"easy","question":"What is the name of Florida’s softball stadium?","choices":["Katie Seashole Pressly Stadium","Condron Ballpark","O'Connell Center","Exactech Arena"],"answer_index":0},
 ]
@@ -73,9 +78,20 @@ def _clean(s: str) -> str:
     return s.strip()
 
 
-def _qid(question_text: str, choices: list[str]) -> str:
-    payload = _clean(question_text) + "|" + "|".join(_clean(c) for c in choices)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+def _canonical_question(q: str) -> str:
+    """
+    Canonicalize question text so tiny edits / punctuation / choice order can't bypass duplicate detection.
+    """
+    q = _clean(q).lower()
+    q = q.replace("university of florida", "florida")
+    q = re.sub(r"[^a-z0-9\s]", "", q)   # drop punctuation
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def _qid_from_question_only(question_text: str) -> str:
+    canon = _canonical_question(question_text)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
 
 
 def _pick_channel_id(interaction: discord.Interaction) -> str:
@@ -138,7 +154,6 @@ async def _get_candidate() -> dict | None:
 async def _announce_start(channel: discord.abc.Messageable, event_type: str):
     title = "✅ Day Trivia Event started!" if event_type == "day" else "✅ Week Trivia Event started!"
     await channel.send(
-        "@everyone\n"
         f"**{title}**\n"
         "⏱️ 30 seconds to answer\n"
         "🕔 Every 5 minutes\n"
@@ -148,7 +163,7 @@ async def _announce_start(channel: discord.abc.Messageable, event_type: str):
 
 async def _announce_end(channel: discord.abc.Messageable, event_id: int):
     top10 = db.top_scores(event_id, 10)
-    lines = ["@everyone", "**🏁 Trivia Event ended!**", "", "**🏆 Top 10**"]
+    lines = ["**🏁 Trivia Event ended!**", "", "**🏆 Top 10**"]
     if not top10:
         lines.append("No scores yet.")
     else:
@@ -231,35 +246,25 @@ async def _post_question_for_guild(guild_id: str):
             db.update_next_ask(event_id, now + 60)
             return
 
-        # This line will crash if DB isn't updated; so we guard it too.
-        try:
-            recent_count = db.guild_recent_count(guild_id)
-        except Exception as e:
-            print("DB_MISSING_RECENT_COUNT:", repr(e))
-            recent_count = 0
-
+        recent_count = db.guild_recent_count(guild_id)
         effective_window = min(RECENT_WINDOW, recent_count)
 
-        for _ in range(40):
+        for _ in range(50):
             trivia = await _get_candidate()
             if not trivia:
                 continue
-            qid = _qid(trivia["question"], trivia["choices"])
 
-            try:
-                if effective_window > 0 and db.guild_recent_has(guild_id, qid, effective_window):
-                    continue
-            except Exception as e:
-                print("DB_RECENT_HAS_ERROR:", repr(e))
+            # IMPORTANT: duplicates are now based on the QUESTION ONLY
+            qid = _qid_from_question_only(trivia["question"])
 
+            if effective_window > 0 and db.guild_recent_has(guild_id, qid, effective_window):
+                continue
+
+            # also prevent duplicates within the same event
             if not db.record_question(event_id, qid, now):
                 continue
 
-            try:
-                db.guild_recent_add(guild_id, qid, now, RECENT_WINDOW)
-            except Exception as e:
-                print("DB_RECENT_ADD_ERROR:", repr(e))
-
+            db.guild_recent_add(guild_id, qid, now, RECENT_WINDOW)
             db.update_next_ask(event_id, now + QUESTION_INTERVAL_SECONDS)
 
             embed = discord.Embed(title="🐊 Florida Gators Trivia", description=trivia["question"])
@@ -274,11 +279,12 @@ async def _post_question_for_guild(guild_id: str):
             return
 
         db.update_next_ask(event_id, now + 60)
-        await ch.send("⚠️ Couldn’t generate a valid question right now. Trying again in 60 seconds.")
+        await ch.send("⚠️ Couldn’t generate a new non-duplicate question right now. Trying again in 60 seconds.")
 
 
 async def scheduler_loop():
     await client.wait_until_ready()
+    print("SCHEDULER_STARTED")
     while not client.is_closed():
         for g in client.guilds:
             try:
@@ -286,6 +292,37 @@ async def scheduler_loop():
             except Exception as e:
                 print("SCHEDULER_GUILD_ERROR:", str(g.id), repr(e))
         await asyncio.sleep(15)
+
+
+@tree.command(name="event_day", description="Start a 24-hour trivia event (question every 5 minutes)")
+async def event_day(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.guild_id:
+        await interaction.followup.send("Use this in a server.", ephemeral=True)
+        return
+
+    if db.get_active_event(str(interaction.guild_id)):
+        await interaction.followup.send("An event is already running. Use /stop first.", ephemeral=True)
+        return
+
+    now = _now()
+    end_ts = now + 24 * 60 * 60
+    channel_id = _pick_channel_id(interaction)
+
+    db.create_event(str(interaction.guild_id), str(channel_id), "day", now, end_ts)
+
+    try:
+        await _announce_start(interaction.channel, "day")
+    except Exception as e:
+        print("ANNOUNCE_ERROR:", repr(e))
+
+    await interaction.followup.send("✅ Day event started.", ephemeral=True)
+
+    try:
+        await _post_question_for_guild(str(interaction.guild_id))
+    except Exception as e:
+        print("POST_FIRST_ERROR:", repr(e))
 
 
 @tree.command(name="event_week", description="Start a 7-day trivia event (question every 5 minutes)")
@@ -306,16 +343,13 @@ async def event_week(interaction: discord.Interaction):
 
     db.create_event(str(interaction.guild_id), str(channel_id), "week", now, end_ts)
 
-    # Announce in channel (non-ephemeral)
     try:
         await _announce_start(interaction.channel, "week")
     except Exception as e:
         print("ANNOUNCE_ERROR:", repr(e))
 
-    # Always respond to the slash command quickly
     await interaction.followup.send("✅ Week event started.", ephemeral=True)
 
-    # Post first question after responding (so Discord never times out)
     try:
         await _post_question_for_guild(str(interaction.guild_id))
     except Exception as e:
