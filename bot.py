@@ -25,8 +25,8 @@ TRIVIA_CHANNEL_ID = os.getenv("TRIVIA_CHANNEL_ID")
 # LOCKED EVENT SETTINGS
 DAY_QUESTION_INTERVAL_SECONDS = 5 * 60        # every 5 minutes
 WEEK_QUESTION_INTERVAL_SECONDS = 30 * 60      # every 30 minutes
-ANSWER_WINDOW_SECONDS = 30                    # 30 seconds to answer
-RECENT_WINDOW = 1000                          # across-guild recent anti-repeat window (ok)
+ANSWER_WINDOW_SECONDS = 30
+RECENT_WINDOW = 1000
 
 SPORTS = [
     "football",
@@ -48,11 +48,12 @@ SPORTS = [
     "olympics",
 ]
 DIFFICULTIES = ["easy", "medium", "hard", "expert"]
-DIFFICULTY_WEIGHTS = [0.35, 0.35, 0.22, 0.08]
+# Default mix for live events (still challenging, but not impossible).
+DIFFICULTY_WEIGHTS = [0.15, 0.35, 0.35, 0.15]
 
 db.init_db()
 
-# Fallback is only used if OpenAI is unavailable (but your config requires OpenAI, so normally this won't run).
+# Keep fallback, but duplicates are now controlled by canonical question hash.
 FALLBACK_BANK = [
     {"sport":"football","difficulty":"easy","question":"What is the nickname of Ben Hill Griffin Stadium?","choices":["The Swamp","Death Valley","The Horseshoe","The Big House"],"answer_index":0},
     {"sport":"football","difficulty":"easy","question":"What conference do the Florida Gators play in?","choices":["SEC","ACC","Big Ten","Big 12"],"answer_index":0},
@@ -70,6 +71,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 GUILD_LOCKS: dict[str, asyncio.Lock] = {}
+SEED_TASKS: dict[str, asyncio.Task] = {}
 
 
 def _lock_for_guild(guild_id: str) -> asyncio.Lock:
@@ -89,9 +91,12 @@ def _clean(s: str) -> str:
 
 
 def _canonical_question(q: str) -> str:
+    """
+    Canonicalize question text so tiny edits / punctuation / choice order can't bypass duplicate detection.
+    """
     q = _clean(q).lower()
     q = q.replace("university of florida", "florida")
-    q = re.sub(r"[^a-z0-9\s]", "", q)
+    q = re.sub(r"[^a-z0-9\s]", "", q)   # drop punctuation
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
@@ -137,11 +142,17 @@ def _validate_trivia(trivia: dict) -> dict | None:
             return None
         sport = _clean(trivia.get("sport", "")) or "football"
         difficulty = _clean(trivia.get("difficulty", "")) or "medium"
+
         out = {"question": q, "choices": choices, "answer_index": ans, "sport": sport, "difficulty": difficulty}
-        if "explanation" in trivia:
+        if isinstance(trivia.get("explanation"), str):
             out["explanation"] = _clean(trivia.get("explanation", ""))
-        if "tags" in trivia and isinstance(trivia.get("tags"), list):
-            out["tags"] = [ _clean(t) for t in trivia.get("tags", []) if _clean(t) ]
+        if isinstance(trivia.get("tags"), list):
+            out["tags"] = [_clean(t) for t in trivia.get("tags", []) if _clean(t)]
+        if isinstance(trivia.get("confidence"), (int, float)):
+            try:
+                out["confidence"] = float(trivia.get("confidence"))
+            except Exception:
+                pass
         return out
     except Exception:
         return None
@@ -152,6 +163,7 @@ async def _get_candidate() -> dict | None:
     sport = random.choice(SPORTS)
     difficulty = random.choices(DIFFICULTIES, weights=DIFFICULTY_WEIGHTS, k=1)[0]
 
+    # Add topic variety so we can scale into 10k-25k questions without feeling repetitive.
     topic = random.choice(
         [
             "championships and titles",
@@ -166,17 +178,112 @@ async def _get_candidate() -> dict | None:
         ]
     )
 
+    # Generate via OpenAI and validate. Offload sync call so we don't block the event loop.
     if generate_trivia:
         try:
-            trivia, _h = generate_trivia(sport=sport, difficulty=difficulty, mode="MCQ", topic=topic)
+            trivia, _h = await asyncio.to_thread(generate_trivia, sport=sport, difficulty=difficulty, mode="MCQ", topic=topic)
             v = _validate_trivia(trivia) if isinstance(trivia, dict) else None
             if v:
                 return v
         except Exception as e:
             print("AI_TRIVIA_ERROR:", repr(e))
 
+    # Fallback (only used if AI is unavailable). Small bank, but still valid.
     fb = random.choice(FALLBACK_BANK).copy()
     return _validate_trivia(fb)
+
+
+async def _get_candidate_seed() -> dict | None:
+    """Heavier on hard/expert + recruiting/Olympics for building a challenging bank."""
+    sport = random.choice(SPORTS)
+    difficulty = random.choices(DIFFICULTIES, weights=[0.05, 0.20, 0.45, 0.30], k=1)[0]
+
+    topic = random.choice(
+        [
+            "recruiting (commits, flips, signing classes, staff, evaluations)",
+            "Olympics (UF/Florida athletes, medals, events, years)",
+            "records and milestones",
+            "awards and honors",
+            "postseason and championships",
+            "iconic games and moments",
+            "coaches and coaching eras",
+            "all-time great players",
+            "venue history and traditions (deep cuts)",
+        ]
+    )
+
+    if generate_trivia:
+        try:
+            trivia, _h = await asyncio.to_thread(generate_trivia, sport=sport, difficulty=difficulty, mode="MCQ", topic=topic)
+            v = _validate_trivia(trivia) if isinstance(trivia, dict) else None
+            if v:
+                return v
+        except Exception as e:
+            print("AI_TRIVIA_ERROR(SEED):", repr(e))
+
+    fb = random.choice(FALLBACK_BANK).copy()
+    return _validate_trivia(fb)
+
+
+async def _seed_bank_worker(guild_id: str, channel_id: int, target_total: int, concurrency: int = 3):
+    """Generate questions until the global bank has target_total rows."""
+    ch = await _safe_fetch_channel(channel_id)
+    if not ch:
+        return
+
+    start_total = db.question_bank_count()
+    await ch.send(
+        f"🧠 Seeding trivia bank: starting at **{start_total:,}** questions. Target: **{target_total:,}**.\n"
+        f"This will generate mostly **hard/expert** questions (including recruiting + Olympics)."
+    )
+
+    inserted = 0
+    last_report = 0
+
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def make_one():
+        nonlocal inserted
+        async with sem:
+            cand = await _get_candidate_seed()
+            if not cand:
+                return
+            qid = _qid_from_question_only(cand["question"])
+            ok = db.upsert_question_bank(
+                question_id=qid,
+                sport=str(cand.get("sport") or ""),
+                difficulty=str(cand.get("difficulty") or ""),
+                question=str(cand["question"]),
+                choices=list(cand["choices"]),
+                answer_index=int(cand["answer_index"]),
+                explanation=str(cand.get("explanation") or ""),
+                tags=list(cand.get("tags") or []),
+                created_ts=_now(),
+            )
+            if ok:
+                inserted += 1
+
+    try:
+        while True:
+            current_total = db.question_bank_count()
+            if current_total >= target_total:
+                break
+
+            burst = max(10, concurrency * 10)
+            tasks = [asyncio.create_task(make_one()) for _ in range(burst)]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            if inserted - last_report >= 500 or (db.question_bank_count() >= target_total):
+                last_report = inserted
+                current_total = db.question_bank_count()
+                await ch.send(f"📦 Bank progress: **{current_total:,}** total (added **{inserted:,}** this run)")
+
+            await asyncio.sleep(0.5)
+    finally:
+        SEED_TASKS.pop(guild_id, None)
+
+    end_total = db.question_bank_count()
+    await ch.send(f"✅ Seeding complete. Bank now has **{end_total:,}** questions (added **{inserted:,}**).")
 
 
 async def _announce_start(channel: discord.abc.Messageable, event_type: str):
@@ -216,13 +323,11 @@ class TriviaView(discord.ui.View):
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
-
         try:
             if self.message:
                 await self.message.edit(view=self)
         except Exception:
             pass
-
         try:
             if self.message:
                 await self.message.channel.send(f"✅ Correct answer: **{self.choices[self.answer_index]}**")
@@ -281,10 +386,8 @@ async def _post_question_for_guild(guild_id: str):
         recent_count = db.guild_recent_count(guild_id)
         effective_window = min(RECENT_WINDOW, recent_count)
 
-        # 1) Prefer pulling from the global bank (scales to 10k-25k+ over time)
         trivia = db.pick_question_from_bank(guild_id, event_id, effective_window)
 
-        # 2) If bank is empty/exhausted for this event, generate a batch and upsert into bank
         if not trivia:
             inserted = 0
             for _ in range(30):
@@ -319,7 +422,6 @@ async def _post_question_for_guild(guild_id: str):
 
         qid = trivia.get("question_id") or _qid_from_question_only(trivia["question"])
 
-        # Prevent repeats within event (hard lock)
         if not db.record_question(event_id, qid, now):
             db.update_next_ask(event_id, now + 60)
             return
@@ -340,111 +442,4 @@ async def _post_question_for_guild(guild_id: str):
 
 
 async def scheduler_loop():
-    await client.wait_until_ready()
-    print("SCHEDULER_STARTED")
-    while not client.is_closed():
-        for g in client.guilds:
-            try:
-                await _post_question_for_guild(str(g.id))
-            except Exception as e:
-                print("SCHEDULER_GUILD_ERROR:", str(g.id), repr(e))
-        await asyncio.sleep(15)
-
-
-@tree.command(name="event_day", description="Start a 24-hour trivia event (question every 5 minutes)")
-async def event_day(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    if not interaction.guild_id:
-        await interaction.followup.send("Use this in a server.", ephemeral=True)
-        return
-
-    if db.get_active_event(str(interaction.guild_id)):
-        await interaction.followup.send("An event is already running. Use /stop first.", ephemeral=True)
-        return
-
-    now = _now()
-    end_ts = now + 24 * 60 * 60
-    channel_id = _pick_channel_id(interaction)
-
-    db.create_event(str(interaction.guild_id), str(channel_id), "day", now, end_ts)
-
-    try:
-        await _announce_start(interaction.channel, "day")
-    except Exception as e:
-        print("ANNOUNCE_ERROR:", repr(e))
-
-    await interaction.followup.send("✅ Day event started.", ephemeral=True)
-
-    try:
-        await _post_question_for_guild(str(interaction.guild_id))
-    except Exception as e:
-        print("POST_FIRST_ERROR:", repr(e))
-
-
-@tree.command(name="event_week", description="Start a 7-day trivia event (question every 30 minutes)")
-async def event_week(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    if not interaction.guild_id:
-        await interaction.followup.send("Use this in a server.", ephemeral=True)
-        return
-
-    if db.get_active_event(str(interaction.guild_id)):
-        await interaction.followup.send("An event is already running. Use /stop first.", ephemeral=True)
-        return
-
-    now = _now()
-    end_ts = now + 7 * 24 * 60 * 60
-    channel_id = _pick_channel_id(interaction)
-
-    db.create_event(str(interaction.guild_id), str(channel_id), "week", now, end_ts)
-
-    try:
-        await _announce_start(interaction.channel, "week")
-    except Exception as e:
-        print("ANNOUNCE_ERROR:", repr(e))
-
-    await interaction.followup.send("✅ Week event started.", ephemeral=True)
-
-    try:
-        await _post_question_for_guild(str(interaction.guild_id))
-    except Exception as e:
-        print("POST_FIRST_ERROR:", repr(e))
-
-
-@tree.command(name="stop", description="Stop the current trivia event")
-async def stop(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    if not interaction.guild_id:
-        await interaction.followup.send("Use this in a server.", ephemeral=True)
-        return
-
-    event = db.get_active_event(str(interaction.guild_id))
-    if not event:
-        await interaction.followup.send("No active event.", ephemeral=True)
-        return
-
-    event_id = int(event["id"])
-    ch = await _safe_fetch_channel(int(event["channel_id"]))
-    if not ch:
-        ch = interaction.channel
-
-    try:
-        await _announce_end(ch, event_id)
-    except Exception as e:
-        print("STOP_ANNOUNCE_END_FAILED:", repr(e))
-
-    db.end_event(event_id)
-    await interaction.followup.send("✅ Event stopped.", ephemeral=True)
-
-
-@client.event
-async def on_ready():
-    await tree.sync()
-    print(f"Logged in as {client.user} (ID: {client.user.id})")
-    client.loop.create_task(scheduler_loop())
-
-
-client.run(TOKEN)
+    await clien
