@@ -33,6 +33,12 @@ def init_db():
             ")"
         )
 
+        # Add answer_window_seconds column if missing (safe migration)
+        try:
+            c.execute("ALTER TABLE events ADD COLUMN answer_window_seconds INTEGER NOT NULL DEFAULT 30")
+        except sqlite3.OperationalError:
+            pass
+
         c.execute(
             "CREATE TABLE IF NOT EXISTS event_questions ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -62,11 +68,9 @@ def init_db():
             ")"
         )
 
-        # ✅ These were the lines that got broken in your deployed file.
         c.execute("CREATE INDEX IF NOT EXISTS idx_grq_guild_id_id ON guild_recent_questions(guild_id, id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_grq_guild_qid ON guild_recent_questions(guild_id, question_id)")
 
-        # Global bank (this is how you get 10k–25k+)
         c.execute(
             "CREATE TABLE IF NOT EXISTS question_bank ("
             "question_id TEXT PRIMARY KEY, "
@@ -127,7 +131,7 @@ def pick_question_from_bank(guild_id: str, event_id: int, recent_window: int):
     with conn() as c:
         rows = c.execute(
             "SELECT question_id, sport, difficulty, question, choices_json, answer_index, explanation, tags_json "
-            "FROM question_bank ORDER BY created_ts DESC LIMIT 600"
+            "FROM question_bank ORDER BY created_ts DESC LIMIT 800"
         ).fetchall()
 
         if not rows:
@@ -174,12 +178,12 @@ def get_active_event(guild_id):
         return dict(row) if row else None
 
 
-def create_event(guild_id, channel_id, event_type, start_ts, end_ts):
+def create_event(guild_id, channel_id, event_type, start_ts, end_ts, answer_window_seconds: int):
     with conn() as c:
         cur = c.execute(
-            "INSERT INTO events (guild_id, channel_id, event_type, start_ts, end_ts, next_ask_ts, active) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1)",
-            (guild_id, channel_id, event_type, start_ts, end_ts, start_ts),
+            "INSERT INTO events (guild_id, channel_id, event_type, start_ts, end_ts, next_ask_ts, active, answer_window_seconds) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            (guild_id, channel_id, event_type, start_ts, end_ts, start_ts, int(answer_window_seconds)),
         )
         return cur.lastrowid
 
