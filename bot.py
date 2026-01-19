@@ -1,3 +1,5 @@
+print("BOT_VERSION: MONTH_ONLY_RUSH_8H_20Q")
+
 import os
 import time
 import asyncio
